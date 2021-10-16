@@ -1,35 +1,36 @@
 import numpy as np
 from numba import jit
+import math
+import cv2
 from pythonabm import Simulation, record_time
 
 
 @jit(nopython=True)
 def midrange_attraction(r_ij, r_e, alpha, u_i, u_j, u_11=30, u_12=1, u_22=5):
     u_ij = np.array([u_22, u_12, u_11])
-    return u_ij[(u_i + u_j)]*(np.linalg.norm(r_ij) - r_e)*(r_ij/np.linalg.norm(r_ij)) + alpha*(2*np.random.rand(3)-1)*np.array([1, 1, 0])
+    return u_ij[(u_i + u_j)]*(np.linalg.norm(r_ij) - r_e)*(r_ij/np.linalg.norm(r_ij)) + alpha*(2*np.random.rand(3)-1)*np.array([1, 1, 1])
 
-'''
-def set_division_threshold(num_cells, alpha=12.5, a_0=10.4, beta=0.72):
-    """Distribution of cell division thresholds modeled by a shifted gamma distribution
-       from Stukalin et al., RSIF 2013
-    """
-    return (np.random.gamma(alpha, beta, num_cells) + a_0) * 3600
-'''
 
-def set_division_threshold(num_cells, cell_type, alpha=12.5, a_0=10.4, beta=0.72):
-    cell_division = [[],[12.5, 10.4, 0.72]]
-    fixed_cell_division_time = np.array([51, 18])
-    #alpha, a_0, beta = cell_division[cell_type]
-    # return (np.random.gamma(alpha, beta, num_cells) + a_0) * 3600
-    return fixed_cell_division_time[cell_type] * 3600
+def set_division_threshold(num_cells, cell_type):
+    cell_division = np.array([[25, 20.8, 0.72],[12.5, 10.4, 0.72]])
+    # fixed_cell_division_time = np.array([51, 18])
+    gamma_params = cell_division[cell_type]
+    thresh = np.zeros(num_cells)
+    if num_cells > 1:
+        for i in range(num_cells):
+            thresh[i] = (np.random.gamma(gamma_params[i,0], gamma_params[i,2], 1) + gamma_params[i,1]) * 3600
+        return thresh
+    return (np.random.gamma(gamma_params[0], gamma_params[2], 1) + gamma_params[1]) * 3600
+    # return fixed_cell_division_time[cell_type] * 3600
+
 
 @jit(nopython=True)
-def pairwise_numba(cell_type, cell_neighbors, cell_neighbors_type, cell_rad, alpha, r_e=1.01):
+def pairwise_numba(cell_type, cell_neighbors, cell_neighbors_type, cell_rad, alpha=10, r_e=1.01):
     pairwise_force = np.zeros(3)
     for i in range(len(cell_neighbors)):
         r_ij_mag = np.linalg.norm(cell_neighbors[i])
         if r_ij_mag == 0:
-            pairwise_force += alpha*(2*np.random.rand(3)-1)*np.array([1, 1, 0])
+            pairwise_force += alpha*(2*np.random.rand(3)-1)*np.array([1, 1, 1])
         elif 0 < r_ij_mag < 2 * cell_rad:
             pairwise_force -= (10**4)*(cell_neighbors[i]/r_ij_mag)
         elif 2 * cell_rad < r_ij_mag:
@@ -64,38 +65,42 @@ class TestSimulation(Simulation):
         self.radii = self.agent_array(initial=lambda: self.cell_rad)
         # 1 is HEK293FT Cell (yellow), 0 is CHO K1 Cell (blue)
         self.cell_type = np.random.choice([1, 0], self.number_agents, p=[self.ratio, 1 - self.ratio])
+        self.colors[:] = [0,0,255]
         self.colors[self.cell_type.nonzero()] = [255, 255, 0]
 
         # Setting division times (in seconds):
         self.division_threshold = set_division_threshold(self.number_agents, self.cell_type)
-        self.division_set = np.random.rand(self.number_agents) * 51 * 3600
+        self.division_set = np.random.rand(self.number_agents) * 38 * 3600
         self.division_set[self.cell_type.nonzero()] = np.random.rand(len(self.division_set[self.cell_type.nonzero()])) * 19 * 3600
+
 
         # indicate agent graphs and create the graphs for holding agent neighbors
         self.indicate_graphs("neighbor_graph")
         self.neighbor_graph = self.agent_graph()
-        for i in range(self.number_agents):
-            self.remove_overlap(i)
+        # for i in range(self.number_agents):
+        #     self.remove_overlap(i)
         # record initial values
         self.step_values()
-        self.step_image()
+        self.step_image_3d()
+        # self.step_image_zstack(100,self.size[2])
 
     def step(self):
         """ Overrides the step() method from the Simulation class.
         """
         # get all neighbors within threshold (1.6 * diameter)
         # call the following methods that update agent values
-        for i in range(60):
+        for i in range(1000):
             self.reproduce(1)
             self.get_neighbors(self.neighbor_graph, 3.2*self.cell_rad)
-            # self.move(), pre numba optimization
             self.move_numba(well_rad=self.well_rad)
             # add/remove agents from the simulation
             self.update_populations()
 
         # get the following data
         self.step_values()
-        self.step_image()
+        self.step_image_3d()
+        # self.step_image_zstack(100, self.size[2])
+
         self.temp()
         self.data()
 
@@ -172,22 +177,7 @@ class TestSimulation(Simulation):
         self.removing[:] = False
 
     @record_time
-    def move(self):
-        """ Assigns new location to agent.
-        """
-        for index in range(self.number_agents):
-            # get new location position
-            self.new_locations[index] = self.locations[index] + .05 * self.radii[index]*\
-                                        self.cell_net_force(self.locations[index], index, well_rad=self.well_rad)
-
-            # check that the new location is within the space, otherwise use boundary values
-            # Assumes square size.
-        self.new_locations = np.where(self.new_locations > self.well_rad, self.well_rad, self.new_locations)
-        self.new_locations = np.where(self.new_locations < 0, 0, self.new_locations)
-        self.locations = self.new_locations
-
-    @record_time
-    def move_numba(self, well_rad=325, alpha=10):
+    def move_numba(self, well_rad=325):
         for index in range(self.number_agents):
             # get new location position
             cell_loc = self.locations[index] - np.array(self.size)/2
@@ -195,12 +185,12 @@ class TestSimulation(Simulation):
             sum_force = np.zeros(3)
             if len(cell_neighbors_loc) > 0:
                 cell_neighbors_type = np.array(self.cell_type[self.neighbor_graph.neighbors(index)])
-                cell_neighbors = cell_neighbors_loc - np.array(self.size)/2
+                cell_neighbors = cell_neighbors_loc - np.array(self.size) / 2
                 cell_neighbors = np.array(cell_neighbors - cell_loc)
-                sum_force = pairwise_numba(self.cell_type[index], cell_neighbors, cell_neighbors_type, self.cell_rad, alpha)
-            net_force = -(cell_loc/well_rad)*np.sqrt(1-(np.linalg.norm(cell_loc)/well_rad)**2)
+                sum_force = pairwise_numba(self.cell_type[index], cell_neighbors, cell_neighbors_type, self.cell_rad)
+            net_force = -(cell_loc/well_rad)*np.sqrt(1-(np.linalg.norm(cell_loc)/(well_rad))**2)
             total_force = (sum_force + net_force)/np.linalg.norm(sum_force + net_force)
-            self.new_locations[index] = self.locations[index] + .2 * self.cell_rad * total_force
+            self.new_locations[index] = self.locations[index] + .1 * self.cell_rad * total_force
 
             # check that the new location is within the space, otherwise use boundary values
         self.new_locations = np.where(self.new_locations > self.well_rad, self.well_rad, self.new_locations)
@@ -231,6 +221,32 @@ class TestSimulation(Simulation):
         sim.full_setup()
         sim.run_simulation()
 
+    def remove_overlap(self, index):
+        self.get_neighbors(self.neighbor_graph, 2*self.radii[index])
+        while len(self.neighbor_graph.neighbors(index)) > 0:
+            for neighbor_cell in self.neighbor_graph.neighbors(index):
+                vec = np.random.rand(3)*np.array([1, 1, 1])
+                self.locations[index] += vec
+                self.locations[neighbor_cell] -= vec
+            self.get_neighbors(self.neighbor_graph, 2*self.radii[index])
+
+    # obsolete
+    @record_time
+    def move(self):
+        """ Assigns new location to agent.
+        """
+        for index in range(self.number_agents):
+            # get new location position
+            self.new_locations[index] = self.locations[index] + .05 * self.radii[index]*\
+                                        self.cell_net_force(self.locations[index], index, well_rad=self.well_rad)
+
+            # check that the new location is within the space, otherwise use boundary values
+            # Assumes square size.
+        self.new_locations = np.where(self.new_locations > self.well_rad, self.well_rad, self.new_locations)
+        self.new_locations = np.where(self.new_locations < 0, 0, self.new_locations)
+        self.locations = self.new_locations
+
+    # obsolete
     def cell_net_force(self, cell_loc, index, alpha=10, r_e=1.01, well_rad=325):
         # centering cartesian plane
         center = np.array(self.size)/2
@@ -240,7 +256,7 @@ class TestSimulation(Simulation):
             r_ij = (self.locations[pairwise] - center) - new_cell_loc
             r_ij_mag = np.linalg.norm(r_ij)
             if r_ij_mag == 0:
-                pairwise_force += alpha*(2*np.random.rand(3)-1)*np.array([1, 1, 0])
+                pairwise_force += alpha*(2*np.random.rand(3)-1)*np.array([1, 1, 1])
             elif 0 < r_ij_mag < 2*self.radii[index]:
                 pairwise_force += -(10**4)*(r_ij/r_ij_mag)
             elif 2*self.radii[index] < r_ij_mag:
@@ -251,16 +267,6 @@ class TestSimulation(Simulation):
         force_ext = -(new_cell_loc/well_rad)*np.sqrt(1-(np.linalg.norm(new_cell_loc)/well_rad)**2)
         return (force_ext + pairwise_force)/np.linalg.norm(force_ext + pairwise_force)
         # return force_ext + pairwise_force
-
-    def remove_overlap(self, index):
-        self.get_neighbors(self.neighbor_graph, 2*self.radii[index])
-        while len(self.neighbor_graph.neighbors(index)) > 0:
-            for neighbor_cell in self.neighbor_graph.neighbors(index):
-                vec = np.random.rand(3)*np.array([1, 1, 0])
-                self.locations[index] += vec
-                self.locations[neighbor_cell] -= vec
-            self.get_neighbors(self.neighbor_graph, 2*self.radii[index])
-
 
 if __name__ == "__main__":
     TestSimulation.start("/Users/andrew/PycharmProjects/tordoff_model/Outputs")
