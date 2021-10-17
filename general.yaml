@@ -7,16 +7,8 @@ cuda: False
 # What will the final step number be? Use for when you are beginning a new simulation (mode: 0). Ex. 192
 end_step: 50000
 
-ratio: .7
-
-# cell radius:
-cell_rad: .5
-
-#well size:
-well_rad: 325
-
 # What are the dimensions (xyz) of the space? Ex. [4000, 4000, 0]
-size: [1, 1, 1]
+size: [1, 1, 0]
 
 # Do you want the agent array values outputted to a CSV at each step? Ex. True
 output_values: True
