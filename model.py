@@ -1,40 +1,93 @@
 import numpy as np
-from numba import jit
-from pythonabm import Simulation, record_time
+import random as r
+from numba import jit, prange
+from pythonabm import Simulation, record_time, template_params
+
+
+# @jit(nopython=True, parallel=True)
+def get_neighbor_forces(number_edges, edges, edge_forces, locations, center, types, radius, alpha=10, r_e=1.01, u_11=30,
+                         u_12=1, u_22=5):
+    for index in range(number_edges):
+        # get indices of cells in edge
+        cell_1 = edges[index][0]
+        cell_2 = edges[index][1]
+
+        # get cell positions
+        cell_1_loc = locations[cell_1] - center
+        cell_2_loc = locations[cell_2] - center
+
+        # get new location position
+        vec = cell_2_loc - cell_1_loc
+        dist = np.linalg.norm(vec)
+
+        # based on the distance apply force differently
+        if dist == 0:
+            edge_forces[index][0] = alpha * (2 * np.random.rand(3) - 1) * np.array([1, 1, 0])
+            edge_forces[index][1] = alpha * (2 * np.random.rand(3) - 1) * np.array([1, 1, 0])
+        elif 0 < dist < 2 * radius:
+            edge_forces[index][0] = -1 * (10 ** 4) * (vec / dist) * 0
+            edge_forces[index][1] = -1 * (10 ** 4) * (vec / dist) * 0
+        else:
+            # get the cell type
+            cell_1_type = types[cell_1]
+            cell_2_type = types[cell_2]
+
+            # get value prior to applying type specific adhesion const
+            value = (np.linalg.norm(vec) - r_e) * (vec / dist) + alpha * (2 * np.random.rand(3) - 1) * np.array([1, 1, 0])
+
+            if cell_1_type == 0 and cell_2_type == 0:
+                edge_forces[index][0] = u_11 * value
+                edge_forces[index][1] = u_11 * value
+            elif cell_1_type == 1 and cell_2_type == 1:
+                edge_forces[index][0] = u_22 * value
+                edge_forces[index][1] = u_22 * value
+            else:
+                edge_forces[index][0] = u_12 * value
+                edge_forces[index][1] = u_12 * value
+
+    return edge_forces
+
+
+@jit(nopython=True, parallel=True)
+def get_gravity_forces(number_cells, locations, center, well_rad, net_forces):
+    for index in range(number_cells):
+        new_loc = locations[index] - center
+        net_forces[index] = -(new_loc / well_rad) * np.sqrt(1 - (np.linalg.norm(new_loc) / well_rad) ** 2)
+    return net_forces
 
 
 @jit(nopython=True)
-def midrange_attraction(r_ij, r_e, alpha, u_i, u_j, u_11=30, u_12=1, u_22=5):
-    u_ij = np.array([u_22, u_12, u_11])
-    return u_ij[(u_i + u_j)]*(np.linalg.norm(r_ij) - r_e)*(r_ij/np.linalg.norm(r_ij)) + alpha*(2*np.random.rand(3)-1)*np.array([1, 1, 0])
+def convert_edge_forces(number_edges, edges, edge_forces, neighbor_forces):
+    for index in range(number_edges):
+        # get indices of cells in edge
+        cell_1 = edges[index][0]
+        cell_2 = edges[index][1]
 
-'''
-def set_division_threshold(num_cells, alpha=12.5, a_0=10.4, beta=0.72):
-    """Distribution of cell division thresholds modeled by a shifted gamma distribution
-       from Stukalin et al., RSIF 2013
+        #
+        neighbor_forces[cell_1] += edge_forces[index][0]
+        neighbor_forces[cell_2] += edge_forces[index][1]
+
+    return neighbor_forces
+
+
+def set_div_thresh(cell_type):
+    """ Specify division threshold value for a particular cell.
+
+        Distribution of cell division thresholds modeled by a shifted gamma distribution
+        from Stukalin et al., RSIF 2013
     """
-    return (np.random.gamma(alpha, beta, num_cells) + a_0) * 3600
-'''
+    # parameters for gamma distribution
+    alpha, a_0, beta = 12.5, 10.4, 0.72
 
-def set_division_threshold(num_cells, cell_type, alpha=12.5, a_0=10.4, beta=0.72):
-    cell_division = [[],[12.5, 10.4, 0.72]]
-    fixed_cell_division_time = np.array([51, 18])
-    #alpha, a_0, beta = cell_division[cell_type]
-    # return (np.random.gamma(alpha, beta, num_cells) + a_0) * 3600
-    return fixed_cell_division_time[cell_type] * 3600
+    # based on cell type return division threshold in seconds
+    if cell_type == 0:
+        # hours = r.gammavariate(alpha, beta) + a_0
+        hours = 51
+    else:
+        # hours = r.gammavariate(alpha, beta) + a_0
+        hours = 18
 
-@jit(nopython=True)
-def pairwise_numba(cell_type, cell_neighbors, cell_neighbors_type, cell_rad, alpha, r_e=1.01):
-    pairwise_force = np.zeros(3)
-    for i in range(len(cell_neighbors)):
-        r_ij_mag = np.linalg.norm(cell_neighbors[i])
-        if r_ij_mag == 0:
-            pairwise_force += alpha*(2*np.random.rand(3)-1)*np.array([1, 1, 0])
-        elif 0 < r_ij_mag < 2 * cell_rad:
-            pairwise_force -= (10**4)*(cell_neighbors[i]/r_ij_mag)
-        elif 2 * cell_rad < r_ij_mag:
-            pairwise_force += midrange_attraction(cell_neighbors[i], r_e, alpha, cell_type, cell_neighbors_type[i])
-    return pairwise_force
+    return hours * 3600
 
 
 class TestSimulation(Simulation):
@@ -44,38 +97,52 @@ class TestSimulation(Simulation):
     def __init__(self):
         # initialize the Simulation object
         Simulation.__init__(self)
-        print(np.__version__)
+
         # read parameters from YAML file and add them to instance variables
         self.yaml_parameters("general.yaml")
+
+        # scale well size by diameter of cell:
+        self.ratio = 0.7
+        self.cell_rad = 0.5
+        self.well_rad = 325
+        self.hek_color = np.array([255, 255, 0], dtype=int)
+        self.cho_color = np.array([50, 50, 255], dtype=int)
+        self.size = np.asarray(self.size) * self.well_rad
 
     def setup(self):
         """ Overrides the setup() method from the Simulation class.
         """
-        # add agents to the simulation
-        self.add_agents(self.num_to_start)
-        # indicate agent arrays and create the arrays with initial conditions
-        self.indicate_arrays("locations", "radii", "new_locations", "colors", "cell_type", "division_set", "division_threshold")
-        # scale well size by diameter of cell:
-        self.well_rad = 2 * self.cell_rad * self.well_rad
-        self.size = np.array(self.size) * self.well_rad
-        # Generate random locations for cells
-        self.locations = np.random.rand(self.number_agents, 3) * self.size
-        self.new_locations = self.locations
-        self.radii = self.agent_array(initial=lambda: self.cell_rad)
-        # 1 is HEK293FT Cell (yellow), 0 is CHO K1 Cell (blue)
-        self.cell_type = np.random.choice([1, 0], self.number_agents, p=[self.ratio, 1 - self.ratio])
-        self.colors[self.cell_type.nonzero()] = [255, 255, 0]
+        # determine the number of agents for each cell type
+        num_hek = int(self.num_to_start * self.ratio)
+        num_cho = self.num_to_start - num_hek
 
-        # Setting division times (in seconds):
-        self.division_threshold = set_division_threshold(self.number_agents, self.cell_type)
-        self.division_set = np.random.rand(self.number_agents) * 51 * 3600
-        self.division_set[self.cell_type.nonzero()] = np.random.rand(len(self.division_set[self.cell_type.nonzero()])) * 19 * 3600
+        # add agents to the simulation
+        self.add_agents(num_hek, agent_type="HEK")
+        self.add_agents(num_cho, agent_type="CHO")
+
+        # indicate agent arrays and create the arrays with initial conditions
+        self.indicate_arrays("locations", "radii", "colors", "cell_type", "division_set", "div_thresh")
+
+        # generate random locations for cells
+        self.locations = np.random.rand(self.number_agents, 3) * self.size
+        self.radii = self.agent_array(initial=lambda: self.cell_rad)
+
+        # 1 is HEK293FT Cell (yellow), 0 is CHO K1 Cell (blue)
+        self.cell_type = self.agent_array(dtype=int, initial={"HEK": lambda: 1, "CHO": lambda: 0})
+        self.colors = self.agent_array(dtype=int, vector=3, initial={"HEK": lambda: self.hek_color, "CHO": lambda: self.cho_color})
+
+        # setting division times (in seconds):
+        self.div_thresh = self.agent_array(initial={"HEK": lambda: set_div_thresh(1), "CHO": lambda: set_div_thresh(0)})
+        self.division_set = self.agent_array(initial={"HEK": lambda: 19 * r.random(), "CHO": lambda: 51 * r.random()})
 
         # indicate agent graphs and create the graphs for holding agent neighbors
         self.indicate_graphs("neighbor_graph")
         self.neighbor_graph = self.agent_graph()
-        for i in range(self.number_agents):
-            self.remove_overlap(i)
+
+        # reduce overlap during initialization
+        # for i in range(self.number_agents):
+        #     self.remove_overlap(i)
+
         # record initial values
         self.step_values()
         self.step_image()
@@ -83,13 +150,17 @@ class TestSimulation(Simulation):
     def step(self):
         """ Overrides the step() method from the Simulation class.
         """
-        # get all neighbors within threshold (1.6 * diameter)
-        # call the following methods that update agent values
+        # preform 60 subsets, each 1 second long
         for i in range(60):
-            self.reproduce(1)
-            self.get_neighbors(self.neighbor_graph, 3.2*self.cell_rad)
-            # self.move(), pre numba optimization
-            self.move_numba(well_rad=self.well_rad)
+            # increase division counter and determine if any cells are dividing
+            self.reproduce(60)
+
+            # get all neighbors within threshold (1.6 * diameter)
+            self.get_neighbors(self.neighbor_graph, 3.2 * self.cell_rad)
+
+            # move the cells
+            self.move_parallel()
+
             # add/remove agents from the simulation
             self.update_populations()
 
@@ -139,18 +210,25 @@ class TestSimulation(Simulation):
 
             # reset division time
             if name == "division_set":
+                # go through the number of cells added
                 for i in range(num_added):
                     # get mother and daughter indices
                     mother = add_indices[i]
                     daughter = self.number_agents + i
+
+                    # set division counter to zero
                     self.__dict__[name][mother] = 0
                     self.__dict__[name][daughter] = 0
 
             # set new division threshold
             if name == "division_threshold":
+                # go through the number of cells added
                 for i in range(num_added):
+                    # get daughter index
                     daughter = self.number_agents + i
-                    self.__dict__[name][daughter] = set_division_threshold(1, self.cell_type[daughter])
+
+                    # set division threshold based on cell type
+                    self.__dict__[name][daughter] = set_div_thresh(self.cell_type[daughter])
 
             # remove indices from the arrays
             self.__dict__[name] = np.delete(self.__dict__[name], remove_indices, axis=0)
@@ -161,7 +239,6 @@ class TestSimulation(Simulation):
             self.__dict__[graph_name].add_vertices(num_added)
             self.__dict__[graph_name].delete_vertices(remove_indices)
 
-
         # change total number of agents and print info to terminal
         self.number_agents += num_added
         # print("\tAdded " + str(num_added) + " agents")
@@ -171,51 +248,52 @@ class TestSimulation(Simulation):
         self.hatching[:] = False
         self.removing[:] = False
 
-    @record_time
-    def move(self):
-        """ Assigns new location to agent.
-        """
-        for index in range(self.number_agents):
-            # get new location position
-            self.new_locations[index] = self.locations[index] + .05 * self.radii[index]*\
-                                        self.cell_net_force(self.locations[index], index, well_rad=self.well_rad)
+    def move_parallel(self):
+        edges = np.asarray(self.neighbor_graph.get_edgelist())
+        num_edges = len(edges)
+        edge_forces = np.zeros((num_edges, 2, 3))
+        center = self.size / 2
+        neighbor_forces = np.zeros((self.number_agents, 3))
+        grav_forces = np.zeros((self.number_agents, 3))
 
-            # check that the new location is within the space, otherwise use boundary values
-            # Assumes square size.
-        self.new_locations = np.where(self.new_locations > self.well_rad, self.well_rad, self.new_locations)
-        self.new_locations = np.where(self.new_locations < 0, 0, self.new_locations)
-        self.locations = self.new_locations
+        # get adhesive/repulsive forces from neighbors and gravity forces
+        edge_forces = get_neighbor_forces(num_edges, edges, edge_forces, self.locations, center, self.cell_type,
+                                          self.cell_rad)
+        neighbor_forces = convert_edge_forces(num_edges, edges, edge_forces, neighbor_forces)
+        grav_forces = get_gravity_forces(self.number_agents, self.locations, center, self.well_rad, grav_forces)
 
-    @record_time
-    def move_numba(self, well_rad=325, alpha=10):
-        for index in range(self.number_agents):
-            # get new location position
-            cell_loc = self.locations[index] - np.array(self.size)/2
-            cell_neighbors_loc = self.locations[self.neighbor_graph.neighbors(index)]
-            sum_force = np.zeros(3)
-            if len(cell_neighbors_loc) > 0:
-                cell_neighbors_type = np.array(self.cell_type[self.neighbor_graph.neighbors(index)])
-                cell_neighbors = cell_neighbors_loc - np.array(self.size)/2
-                cell_neighbors = np.array(cell_neighbors - cell_loc)
-                sum_force = pairwise_numba(self.cell_type[index], cell_neighbors, cell_neighbors_type, self.cell_rad, alpha)
-            net_force = -(cell_loc/well_rad)*np.sqrt(1-(np.linalg.norm(cell_loc)/well_rad)**2)
-            total_force = (sum_force + net_force)/np.linalg.norm(sum_force + net_force)
-            self.new_locations[index] = self.locations[index] + .2 * self.cell_rad * total_force
+        # get normalized vector of total force
+        total_force = neighbor_forces + grav_forces
+        for i in range(self.number_agents):
+            total_force[i] = total_force[i] / np.linalg.norm(total_force[i])
 
-            # check that the new location is within the space, otherwise use boundary values
-        self.new_locations = np.where(self.new_locations > self.well_rad, self.well_rad, self.new_locations)
-        self.new_locations = np.where(self.new_locations < 0, 0, self.new_locations)
-        self.locations = self.new_locations
+        # update locations based on forces
+        self.locations += 0.2 * self.cell_rad * total_force
+
+        # check that the new location is within the space, otherwise use boundary values
+        self.locations = np.where(self.locations > self.well_rad, self.well_rad, self.locations)
+        self.locations = np.where(self.locations < 0, 0, self.locations)
 
     @record_time
     def reproduce(self, ts):
         """ If the agent meets criteria, hatch a new agent.
         """
-        # determine which agents are hatching
-        self.division_set = self.division_set + ts
+        # increase division counter by time step for all agents
+        self.division_set += ts
+
+        # go through all agents marking for division if over the threshold
         for index in range(self.number_agents):
-            if self.division_set[index] > self.division_threshold[index]:
+            if self.division_set[index] > self.div_thresh[index]:
                 self.mark_to_hatch(index)
+
+    def remove_overlap(self, index):
+        self.get_neighbors(self.neighbor_graph, 2*self.radii[index])
+        while len(self.neighbor_graph.neighbors(index)) > 0:
+            for neighbor_cell in self.neighbor_graph.neighbors(index):
+                vec = np.random.rand(3)*np.array([1, 1, 0])
+                self.locations[index] += vec
+                self.locations[neighbor_cell] -= vec
+            self.get_neighbors(self.neighbor_graph, 2*self.radii[index])
 
     @classmethod
     def simulation_mode_0(cls, name, output_dir):
@@ -231,36 +309,7 @@ class TestSimulation(Simulation):
         sim.full_setup()
         sim.run_simulation()
 
-    def cell_net_force(self, cell_loc, index, alpha=10, r_e=1.01, well_rad=325):
-        # centering cartesian plane
-        center = np.array(self.size)/2
-        new_cell_loc = cell_loc - center
-        pairwise_force = np.zeros(3)
-        for pairwise in self.neighbor_graph.neighbors(index):
-            r_ij = (self.locations[pairwise] - center) - new_cell_loc
-            r_ij_mag = np.linalg.norm(r_ij)
-            if r_ij_mag == 0:
-                pairwise_force += alpha*(2*np.random.rand(3)-1)*np.array([1, 1, 0])
-            elif 0 < r_ij_mag < 2*self.radii[index]:
-                pairwise_force += -(10**4)*(r_ij/r_ij_mag)
-            elif 2*self.radii[index] < r_ij_mag:
-                pairwise_force += midrange_attraction(r_ij, r_e, alpha, self.cell_type[index], self.cell_type[pairwise])
-        # 2D static force field drives cells towards center of simulation domain
-        # if np.linalg.norm(pairwise_force) > 0:
-        #     pairwise_force = pairwise_force/np.linalg.norm(pairwise_force)
-        force_ext = -(new_cell_loc/well_rad)*np.sqrt(1-(np.linalg.norm(new_cell_loc)/well_rad)**2)
-        return (force_ext + pairwise_force)/np.linalg.norm(force_ext + pairwise_force)
-        # return force_ext + pairwise_force
-
-    def remove_overlap(self, index):
-        self.get_neighbors(self.neighbor_graph, 2*self.radii[index])
-        while len(self.neighbor_graph.neighbors(index)) > 0:
-            for neighbor_cell in self.neighbor_graph.neighbors(index):
-                vec = np.random.rand(3)*np.array([1, 1, 0])
-                self.locations[index] += vec
-                self.locations[neighbor_cell] -= vec
-            self.get_neighbors(self.neighbor_graph, 2*self.radii[index])
-
 
 if __name__ == "__main__":
-    TestSimulation.start("/Users/andrew/PycharmProjects/tordoff_model/Outputs")
+    # TestSimulation.start("/Users/andrew/PycharmProjects/tordoff_model/Outputs")
+    TestSimulation.start("C:\\Research\\Code\\Tordoff_model_outputs")
