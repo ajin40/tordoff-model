@@ -1,5 +1,6 @@
 import numpy as np
 import random as r
+import math
 from numba import jit, prange
 from pythonabm import Simulation, record_time, template_params
 
@@ -25,8 +26,8 @@ def get_neighbor_forces(number_edges, edges, edge_forces, locations, center, typ
             edge_forces[index][0] = alpha * (2 * np.random.rand(3) - 1) * np.array([1, 1, 0])
             edge_forces[index][1] = alpha * (2 * np.random.rand(3) - 1) * np.array([1, 1, 0])
         elif 0 < dist < 2 * radius:
-            edge_forces[index][0] = -1 * (10 ** 4) * (vec / dist) * 0
-            edge_forces[index][1] = -1 * (10 ** 4) * (vec / dist) * 0
+            edge_forces[index][0] = -1 * (10 ** 4) * (vec / dist)
+            edge_forces[index][1] = 1 * (10 ** 4) * (vec / dist)
         else:
             # get the cell type
             cell_1_type = types[cell_1]
@@ -37,13 +38,13 @@ def get_neighbor_forces(number_edges, edges, edge_forces, locations, center, typ
 
             if cell_1_type == 0 and cell_2_type == 0:
                 edge_forces[index][0] = u_11 * value
-                edge_forces[index][1] = u_11 * value
+                edge_forces[index][1] = -1 * u_11 * value
             elif cell_1_type == 1 and cell_2_type == 1:
                 edge_forces[index][0] = u_22 * value
-                edge_forces[index][1] = u_22 * value
+                edge_forces[index][1] = -1 * u_22 * value
             else:
                 edge_forces[index][0] = u_12 * value
-                edge_forces[index][1] = u_12 * value
+                edge_forces[index][1] = -1 * u_12 * value
 
     return edge_forces
 
@@ -52,7 +53,7 @@ def get_neighbor_forces(number_edges, edges, edge_forces, locations, center, typ
 def get_gravity_forces(number_cells, locations, center, well_rad, net_forces):
     for index in range(number_cells):
         new_loc = locations[index] - center
-        net_forces[index] = -(new_loc / well_rad) * np.sqrt(1 - (np.linalg.norm(new_loc) / well_rad) ** 2)
+        net_forces[index] = -1 * (new_loc / well_rad) * np.sqrt(1 - (np.linalg.norm(new_loc) / well_rad) ** 2)
     return net_forces
 
 
@@ -81,13 +82,43 @@ def set_div_thresh(cell_type):
 
     # based on cell type return division threshold in seconds
     if cell_type == 0:
-        # hours = r.gammavariate(alpha, beta) + a_0
-        hours = 51
+        alpha, a_0, beta = 12.5, 10.4, 0.72
+        hours = r.gammavariate(alpha, beta) + a_0
+        # hours = 51
+        # CHO cell time < HEK cell time
     else:
-        # hours = r.gammavariate(alpha, beta) + a_0
-        hours = 18
+        alpha, a_0, beta = 10, 10.4, 0.72
+        hours = r.gammavariate(alpha, beta) + a_0
 
     return hours * 3600
+
+
+def seed_cells(num_cells, radius, well_dimensions):
+    # radius of the circle
+    # center of sphere (x, y, z)
+    center_x = well_dimensions[0] / 2
+    center_y = well_dimensions[1] / 2
+    center_z = well_dimensions[2] / 2
+    locations = np.zeros((num_cells,3))
+    # random angle
+    if center_z > 0:
+        for i in range(num_cells):
+            phi = 2 * math.pi * r.random()
+            theta = 2 * math.pi * r.random()
+            rad = radius * math.sqrt(r.random())
+            x = rad * math.cos(theta) * math.sin(phi) + center_x
+            y = rad * math.sin(theta) * math.sin(phi) + center_y
+            z = rad * math.cos(phi) + center_z
+            locations[i] = np.array([x, y, z])
+        return locations
+    # random radius
+    for i in range(num_cells):
+        theta = 2 * math.pi * r.random()
+        rad = radius * math.sqrt(r.random())
+        x = rad * math.cos(theta) + center_x
+        y = rad * math.sin(theta) + center_y
+        locations[i] = np.array([x, y, 0])
+    return locations
 
 
 class TestSimulation(Simulation):
@@ -101,13 +132,16 @@ class TestSimulation(Simulation):
         # read parameters from YAML file and add them to instance variables
         self.yaml_parameters("general.yaml")
 
-        # scale well size by diameter of cell:
+        # HEK/CHO ratio
         self.ratio = 0.7
+
+        # scale well size by diameter of cell:
         self.cell_rad = 0.5
         self.well_rad = 325
         self.hek_color = np.array([255, 255, 0], dtype=int)
         self.cho_color = np.array([50, 50, 255], dtype=int)
-        self.size = np.asarray(self.size) * self.well_rad
+        self.dim = np.asarray(self.size)
+        self.size = self.dim * self.well_rad
 
     def setup(self):
         """ Overrides the setup() method from the Simulation class.
@@ -124,7 +158,7 @@ class TestSimulation(Simulation):
         self.indicate_arrays("locations", "radii", "colors", "cell_type", "division_set", "div_thresh")
 
         # generate random locations for cells
-        self.locations = np.random.rand(self.number_agents, 3) * self.size
+        self.locations = seed_cells(self.number_agents, self.well_rad/8, self.size)
         self.radii = self.agent_array(initial=lambda: self.cell_rad)
 
         # 1 is HEK293FT Cell (yellow), 0 is CHO K1 Cell (blue)
@@ -133,15 +167,15 @@ class TestSimulation(Simulation):
 
         # setting division times (in seconds):
         self.div_thresh = self.agent_array(initial={"HEK": lambda: set_div_thresh(1), "CHO": lambda: set_div_thresh(0)})
-        self.division_set = self.agent_array(initial={"HEK": lambda: 19 * r.random(), "CHO": lambda: 51 * r.random()})
+        self.division_set = self.agent_array(initial={"HEK": lambda: 19 * 3600 * r.random(), "CHO": lambda: 19 * 3600 * r.random()})
 
         # indicate agent graphs and create the graphs for holding agent neighbors
         self.indicate_graphs("neighbor_graph")
         self.neighbor_graph = self.agent_graph()
 
         # reduce overlap during initialization
-        # for i in range(self.number_agents):
-        #     self.remove_overlap(i)
+        for i in range(self.number_agents):
+            self.remove_overlap(i)
 
         # record initial values
         self.step_values()
@@ -153,7 +187,7 @@ class TestSimulation(Simulation):
         # preform 60 subsets, each 1 second long
         for i in range(60):
             # increase division counter and determine if any cells are dividing
-            self.reproduce(60)
+            self.reproduce(1)
 
             # get all neighbors within threshold (1.6 * diameter)
             self.get_neighbors(self.neighbor_graph, 3.2 * self.cell_rad)
@@ -268,7 +302,7 @@ class TestSimulation(Simulation):
             total_force[i] = total_force[i] / np.linalg.norm(total_force[i])
 
         # update locations based on forces
-        self.locations += 0.2 * self.cell_rad * total_force
+        self.locations += 0.3 * self.cell_rad * total_force
 
         # check that the new location is within the space, otherwise use boundary values
         self.locations = np.where(self.locations > self.well_rad, self.well_rad, self.locations)
@@ -290,7 +324,8 @@ class TestSimulation(Simulation):
         self.get_neighbors(self.neighbor_graph, 2*self.radii[index])
         while len(self.neighbor_graph.neighbors(index)) > 0:
             for neighbor_cell in self.neighbor_graph.neighbors(index):
-                vec = np.random.rand(3)*np.array([1, 1, 0])
+                mag = np.linalg.norm(self.locations[neighbor_cell] - self.locations[index])
+                vec = mag * np.random.rand(3) * self.dim
                 self.locations[index] += vec
                 self.locations[neighbor_cell] -= vec
             self.get_neighbors(self.neighbor_graph, 2*self.radii[index])
@@ -311,5 +346,5 @@ class TestSimulation(Simulation):
 
 
 if __name__ == "__main__":
-    # TestSimulation.start("/Users/andrew/PycharmProjects/tordoff_model/Outputs")
-    TestSimulation.start("C:\\Research\\Code\\Tordoff_model_outputs")
+    TestSimulation.start("/Users/andrew/PycharmProjects/tordoff_model/Outputs")
+    #TestSimulation.start("C:\\Research\\Code\\Tordoff_model_outputs")
