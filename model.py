@@ -194,7 +194,7 @@ class TestSimulation(Simulation):
 
             # move the cells
             self.move_parallel()
-
+            self.noise()
             # add/remove agents from the simulation
             self.update_populations()
 
@@ -237,7 +237,7 @@ class TestSimulation(Simulation):
                     mother = add_indices[i]
                     daughter = self.number_agents + i
 
-                    # move distance of 5 in random direction
+                    # move distance of radius in random direction
                     vec = self.radii[i] * self.random_vector()
                     self.__dict__[name][mother] += vec
                     self.__dict__[name][daughter] -= vec
@@ -302,7 +302,7 @@ class TestSimulation(Simulation):
             total_force[i] = total_force[i] / np.linalg.norm(total_force[i])
 
         # update locations based on forces
-        self.locations += 0.3 * self.cell_rad * total_force
+        self.locations += 0.1 * self.cell_rad * total_force
 
         # check that the new location is within the space, otherwise use boundary values
         self.locations = np.where(self.locations > self.well_rad, self.well_rad, self.locations)
@@ -344,6 +344,8 @@ class TestSimulation(Simulation):
         sim.full_setup()
         sim.run_simulation()
 
+    def noise(self, alpha=.05):
+        self.locations += alpha * np.random.normal(size=(self.number_agents, 3)) * self.dim
 
 if __name__ == "__main__":
     TestSimulation.start("/Users/andrew/PycharmProjects/tordoff_model/Outputs")
