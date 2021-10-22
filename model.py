@@ -37,11 +37,11 @@ def get_neighbor_forces(number_edges, edges, edge_forces, locations, center, typ
             value = (np.linalg.norm(vec) - r_e) * (vec / dist) + alpha * (2 * np.random.rand(3) - 1) * np.array([1, 1, 0])
 
             if cell_1_type == 0 and cell_2_type == 0:
-                edge_forces[index][0] = u_11 * value
-                edge_forces[index][1] = -1 * u_11 * value
-            elif cell_1_type == 1 and cell_2_type == 1:
                 edge_forces[index][0] = u_22 * value
                 edge_forces[index][1] = -1 * u_22 * value
+            elif cell_1_type == 1 and cell_2_type == 1:
+                edge_forces[index][0] = u_11 * value
+                edge_forces[index][1] = -1 * u_11 * value
             else:
                 edge_forces[index][0] = u_12 * value
                 edge_forces[index][1] = -1 * u_12 * value
@@ -84,7 +84,6 @@ def set_div_thresh(cell_type):
     if cell_type == 0:
         alpha, a_0, beta = 12.5, 10.4, 0.72
         hours = r.gammavariate(alpha, beta) + a_0
-        # hours = 51
         # CHO cell time < HEK cell time
     else:
         alpha, a_0, beta = 10, 10.4, 0.72
@@ -133,7 +132,7 @@ class TestSimulation(Simulation):
         self.yaml_parameters("general.yaml")
 
         # HEK/CHO ratio
-        self.ratio = 0.7
+        self.ratio = 0.3
 
         # scale well size by diameter of cell:
         self.cell_rad = 0.5
@@ -173,9 +172,6 @@ class TestSimulation(Simulation):
         self.indicate_graphs("neighbor_graph")
         self.neighbor_graph = self.agent_graph()
 
-        # reduce overlap during initialization
-        for i in range(self.number_agents):
-            self.remove_overlap(i)
 
         # record initial values
         self.step_values()
@@ -194,7 +190,7 @@ class TestSimulation(Simulation):
 
             # move the cells
             self.move_parallel()
-            self.noise()
+            # self.noise()
             # add/remove agents from the simulation
             self.update_populations()
 
@@ -299,7 +295,11 @@ class TestSimulation(Simulation):
         # get normalized vector of total force
         total_force = neighbor_forces + grav_forces
         for i in range(self.number_agents):
-            total_force[i] = total_force[i] / np.linalg.norm(total_force[i])
+            if np.linalg.norm(total_force[i]) > 0:
+                total_force[i] = total_force[i] / np.linalg.norm(total_force[i])
+            else:
+                # while gravity is active, this shouldn't be there, but otherwise it is.
+                total_force[i] = 0
 
         # update locations based on forces
         self.locations += 0.1 * self.cell_rad * total_force
@@ -344,8 +344,8 @@ class TestSimulation(Simulation):
         sim.full_setup()
         sim.run_simulation()
 
-    def noise(self, alpha=.05):
-        self.locations += alpha * np.random.normal(size=(self.number_agents, 3)) * self.dim
+    def noise(self, alpha=0.01):
+        self.locations += alpha * 2 * self.cell_rad * np.random.normal(size=(self.number_agents, 3)) * self.dim
 
 if __name__ == "__main__":
     TestSimulation.start("/Users/andrew/PycharmProjects/tordoff_model/Outputs")
