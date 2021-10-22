@@ -2,13 +2,13 @@ import numpy as np
 import random as r
 import math
 from numba import jit, prange
-from pythonabm import Simulation, record_time, template_params
+from pythonabm import Simulation, record_time
 
 
-# @jit(nopython=True, parallel=True)
+@jit(nopython=True, parallel=True)
 def get_neighbor_forces(number_edges, edges, edge_forces, locations, center, types, radius, alpha=10, r_e=1.01, u_11=30,
                          u_12=1, u_22=5):
-    for index in range(number_edges):
+    for index in prange(number_edges):
         # get indices of cells in edge
         cell_1 = edges[index][0]
         cell_2 = edges[index][1]
@@ -77,9 +77,6 @@ def set_div_thresh(cell_type):
         Distribution of cell division thresholds modeled by a shifted gamma distribution
         from Stukalin et al., RSIF 2013
     """
-    # parameters for gamma distribution
-    alpha, a_0, beta = 12.5, 10.4, 0.72
-
     # based on cell type return division threshold in seconds
     if cell_type == 0:
         alpha, a_0, beta = 12.5, 10.4, 0.72
@@ -171,7 +168,6 @@ class TestSimulation(Simulation):
         # indicate agent graphs and create the graphs for holding agent neighbors
         self.indicate_graphs("neighbor_graph")
         self.neighbor_graph = self.agent_graph()
-
 
         # record initial values
         self.step_values()
@@ -347,6 +343,7 @@ class TestSimulation(Simulation):
     def noise(self, alpha=0.01):
         self.locations += alpha * 2 * self.cell_rad * np.random.normal(size=(self.number_agents, 3)) * self.dim
 
+
 if __name__ == "__main__":
-    TestSimulation.start("/Users/andrew/PycharmProjects/tordoff_model/Outputs")
-    #TestSimulation.start("C:\\Research\\Code\\Tordoff_model_outputs")
+    # TestSimulation.start("/Users/andrew/PycharmProjects/tordoff_model/Outputs")
+    TestSimulation.start("C:\\Research\\Code\\Tordoff_model_outputs")
