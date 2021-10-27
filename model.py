@@ -2,13 +2,13 @@ import numpy as np
 import random as r
 import math
 from numba import jit, prange
-from pythonabm import Simulation, record_time
+from pythonabm import Simulation, record_time, template_params
 
 
 @jit(nopython=True, parallel=True)
 def get_neighbor_forces(number_edges, edges, edge_forces, locations, center, types, radius, alpha=10, r_e=1.01, u_11=30,
-                         u_12=1, u_22=5):
-    for index in prange(number_edges):
+                         u_12=1, u_22=1):
+    for index in range(number_edges):
         # get indices of cells in edge
         cell_1 = edges[index][0]
         cell_2 = edges[index][1]
@@ -34,17 +34,17 @@ def get_neighbor_forces(number_edges, edges, edge_forces, locations, center, typ
             cell_2_type = types[cell_2]
 
             # get value prior to applying type specific adhesion const
-            value = (np.linalg.norm(vec) - r_e) * (vec / dist) + alpha * (2 * np.random.rand(3) - 1) * np.array([1, 1, 0])
+            value = (dist - r_e) * (vec / dist)
 
             if cell_1_type == 0 and cell_2_type == 0:
-                edge_forces[index][0] = u_22 * value
-                edge_forces[index][1] = -1 * u_22 * value
+                edge_forces[index][0] = u_22 * value + alpha * (2 * np.random.rand(3) - 1) * np.array([1, 1, 0])
+                edge_forces[index][1] = -1 * u_22 * value + alpha * (2 * np.random.rand(3) - 1) * np.array([1, 1, 0])
             elif cell_1_type == 1 and cell_2_type == 1:
-                edge_forces[index][0] = u_11 * value
-                edge_forces[index][1] = -1 * u_11 * value
+                edge_forces[index][0] = u_11 * value + alpha * (2 * np.random.rand(3) - 1) * np.array([1, 1, 0])
+                edge_forces[index][1] = -1 * u_11 * value + alpha * (2 * np.random.rand(3) - 1) * np.array([1, 1, 0])
             else:
-                edge_forces[index][0] = u_12 * value
-                edge_forces[index][1] = -1 * u_12 * value
+                edge_forces[index][0] = u_12 * value + alpha * (2 * np.random.rand(3) - 1) * np.array([1, 1, 0])
+                edge_forces[index][1] = -1 * u_12 * value + alpha * (2 * np.random.rand(3) - 1) * np.array([1, 1, 0])
 
     return edge_forces
 
@@ -77,6 +77,9 @@ def set_div_thresh(cell_type):
         Distribution of cell division thresholds modeled by a shifted gamma distribution
         from Stukalin et al., RSIF 2013
     """
+    # parameters for gamma distribution
+    alpha, a_0, beta = 12.5, 10.4, 0.72
+
     # based on cell type return division threshold in seconds
     if cell_type == 0:
         alpha, a_0, beta = 12.5, 10.4, 0.72
@@ -130,7 +133,7 @@ class TestSimulation(Simulation):
 
         # HEK/CHO ratio
         self.ratio = 0.3
-
+        self.velocity = 0.2
         # scale well size by diameter of cell:
         self.cell_rad = 0.5
         self.well_rad = 325
@@ -163,11 +166,12 @@ class TestSimulation(Simulation):
 
         # setting division times (in seconds):
         self.div_thresh = self.agent_array(initial={"HEK": lambda: set_div_thresh(1), "CHO": lambda: set_div_thresh(0)})
-        self.division_set = self.agent_array(initial={"HEK": lambda: 19 * 3600 * r.random(), "CHO": lambda: 19 * 3600 * r.random()})
+        self.division_set = self.agent_array(initial={"HEK": lambda: 17 * 3600 * r.random(), "CHO": lambda: 16 * 3600 * r.random()})
 
         # indicate agent graphs and create the graphs for holding agent neighbors
         self.indicate_graphs("neighbor_graph")
         self.neighbor_graph = self.agent_graph()
+
 
         # record initial values
         self.step_values()
@@ -192,6 +196,7 @@ class TestSimulation(Simulation):
 
         # get the following data
         self.step_values()
+        print(f"HEK: {np.sum(self.cell_type)}")
         self.step_image()
         self.temp()
         self.data()
@@ -298,7 +303,7 @@ class TestSimulation(Simulation):
                 total_force[i] = 0
 
         # update locations based on forces
-        self.locations += 0.1 * self.cell_rad * total_force
+        self.locations += self.velocity * self.cell_rad * total_force
 
         # check that the new location is within the space, otherwise use boundary values
         self.locations = np.where(self.locations > self.well_rad, self.well_rad, self.locations)
@@ -340,10 +345,9 @@ class TestSimulation(Simulation):
         sim.full_setup()
         sim.run_simulation()
 
-    def noise(self, alpha=0.01):
+    def noise(self, alpha=0.025):
         self.locations += alpha * 2 * self.cell_rad * np.random.normal(size=(self.number_agents, 3)) * self.dim
 
-
 if __name__ == "__main__":
-    # TestSimulation.start("/Users/andrew/PycharmProjects/tordoff_model/Outputs")
-    TestSimulation.start("C:\\Research\\Code\\Tordoff_model_outputs")
+    TestSimulation.start("/Users/andrew/PycharmProjects/tordoff_model/Outputs")
+    #TestSimulation.start("C:\\Research\\Code\\Tordoff_model_outputs")
