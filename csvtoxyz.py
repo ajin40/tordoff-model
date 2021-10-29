@@ -1,6 +1,5 @@
 import os
 import pandas as pd
-import open3d
 
 def csv_to_xyz(datafile):
     # assume datafile name is output:
@@ -24,7 +23,7 @@ def directory_to_xyz(directory, ts):
     os.chdir(directory)
     maxts = len(os.listdir(directory))
     ts_files = []
-    for i in range(int(maxts/ts)):
+    for i in range(int(maxts/ts)+1):
         for file in os.listdir(directory):
             if file.endswith(f"_{i*ts}.csv"):
                 csv_to_xyz(file)

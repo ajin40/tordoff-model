@@ -3,11 +3,12 @@ import random as r
 import math
 from numba import jit, prange
 from pythonabm import Simulation, record_time, template_params
+import matplotlib.pyplot as plt
 
 
 @jit(nopython=True, parallel=True)
 def get_neighbor_forces(number_edges, edges, edge_forces, locations, center, types, radius, alpha=10, r_e=1.01, u_11=30,
-                         u_12=1, u_22=1):
+                         u_12=1, u_22=5):
     for index in range(number_edges):
         # get indices of cells in edge
         cell_1 = edges[index][0]
@@ -133,7 +134,7 @@ class TestSimulation(Simulation):
 
         # HEK/CHO ratio
         self.ratio = 0.3
-        self.velocity = 0.2
+        self.velocity = 0.5
         # scale well size by diameter of cell:
         self.cell_rad = 0.5
         self.well_rad = 325
@@ -141,6 +142,7 @@ class TestSimulation(Simulation):
         self.cho_color = np.array([50, 50, 255], dtype=int)
         self.dim = np.asarray(self.size)
         self.size = self.dim * self.well_rad
+        self.cluster_timer = 0
 
     def setup(self):
         """ Overrides the setup() method from the Simulation class.
@@ -169,12 +171,13 @@ class TestSimulation(Simulation):
         self.division_set = self.agent_array(initial={"HEK": lambda: 17 * 3600 * r.random(), "CHO": lambda: 16 * 3600 * r.random()})
 
         # indicate agent graphs and create the graphs for holding agent neighbors
-        self.indicate_graphs("neighbor_graph")
+        self.indicate_graphs("neighbor_graph", "cluster_graph")
         self.neighbor_graph = self.agent_graph()
-
+        self.cluster_graph = self.agent_graph()
 
         # record initial values
         self.step_values()
+        self.get_clusters(1)
         self.step_image()
 
     def step(self):
@@ -193,9 +196,10 @@ class TestSimulation(Simulation):
             # self.noise()
             # add/remove agents from the simulation
             self.update_populations()
-
+        self.cluster_timer += 1
         # get the following data
         self.step_values()
+        self.get_clusters(1)
         print(f"HEK: {np.sum(self.cell_type)}")
         self.step_image()
         self.temp()
@@ -347,6 +351,40 @@ class TestSimulation(Simulation):
 
     def noise(self, alpha=0.025):
         self.locations += alpha * 2 * self.cell_rad * np.random.normal(size=(self.number_agents, 3)) * self.dim
+
+    def get_clusters(self, cell_type, cluster_threshold=5, time_thresh=20, cluster_distance=3.2):
+        if self.cluster_timer % time_thresh == 0:
+            # Create graphs of specified distance.
+            self.get_neighbors(self.cluster_graph, cluster_distance * self.cell_rad)
+            edges = np.asarray(self.cluster_graph.get_edgelist())
+
+            num_edges = len(edges)
+            # Traverse graphs but filter out the non-desired cell_types
+            for i in range(num_edges):
+                cell_1 = edges[i][0]
+                cell_2 = edges[i][1]
+                if self.cell_type[cell_1] != cell_type or self.cell_type[cell_2] != cell_type:
+                    self.cluster_graph.delete_edges([(cell_1, cell_2)])
+
+            clusters = self.cluster_graph.clusters()
+            file_name = f"{self.name}_values_{self.current_step}_clusters.csv"
+            cluster_file = open(self.values_path + file_name, "w")
+            if len(clusters) > 0:
+                centroids = np.zeros([len(clusters),3])
+                radius = np.zeros(len(clusters))
+
+                for i in range(len(clusters)):
+                    if len(clusters[i]) > cluster_threshold:
+                        location_graph = self.locations[clusters[i]]
+                        centroids[i] = np.mean(location_graph,0)
+                        max_distance = 0
+                        for j in range(len(clusters[i])):
+                            if np.linalg.norm(location_graph[j]-centroids[i]) > max_distance:
+                                max_distance = np.linalg.norm(location_graph[j]-centroids[i])
+                        radius[i] = max_distance
+                        cluster_file.write(f"{centroids[i][0]}, {centroids[i][1]}, {centroids[i][2]}, {radius[i]}\n")
+            cluster_file.close()
+
 
 if __name__ == "__main__":
     TestSimulation.start("/Users/andrew/PycharmProjects/tordoff_model/Outputs")
