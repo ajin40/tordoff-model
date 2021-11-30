@@ -3,7 +3,11 @@ import random as r
 import math
 from numba import jit, prange
 from pythonabm import Simulation, record_time, template_params
-import matplotlib.pyplot as plt
+import cv2
+from numba import cuda
+import numba
+from pythonabm.backend import record_time, check_direct, template_params, check_existing, get_end_step, Graph, \
+    progress_bar, starting_params, check_output_dir, assign_bins_jit, get_neighbors_cpu, get_neighbors_gpu
 
 
 @jit(nopython=True, parallel=True)
@@ -54,9 +58,25 @@ def get_neighbor_forces(number_edges, edges, edge_forces, locations, center, typ
 def get_gravity_forces(number_cells, locations, center, well_rad, net_forces):
     for index in range(number_cells):
         new_loc = locations[index] - center
+        # net_forces[index] = -1 * (new_loc / well_rad) * np.sqrt((np.linalg.norm(new_loc) / well_rad) ** 2)
         net_forces[index] = -1 * (new_loc / well_rad) * np.sqrt(1 - (np.linalg.norm(new_loc) / well_rad) ** 2)
     return net_forces
 
+# The clusters are getting so big that the net force isn't being applied to them
+# TO DO: try to find a way to make relatively small clusters (~ 5-10 cells, the ones in .3 HEK/CHO ratio not
+# be heavily influenced by the cluster forces, but the larger clusters do.
+# OR: remove?
+@jit(nopython=True, parallel=True)
+def get_cluster_forces(clusters, num_clusters, cluster_size, centroids, center, well_rad, net_forces, num_hek):
+    temp = 0
+    for index in range(num_clusters):
+        cluster_loc = centroids[index] - center
+        cluster_force = -1 * ((cluster_size[index] / num_hek) ** 2) * np.sqrt(1 - (cluster_size[index] / num_hek) ** 2)\
+                    * (cluster_loc / well_rad) * np.sqrt(1 - (np.linalg.norm(cluster_loc) / well_rad) ** 2)
+        for i in range(cluster_size[index]):
+            net_forces[clusters[i + temp]] = cluster_force
+        temp += cluster_size[index]
+    return net_forces
 
 @jit(nopython=True)
 def convert_edge_forces(number_edges, edges, edge_forces, neighbor_forces):
@@ -133,15 +153,26 @@ class TestSimulation(Simulation):
         self.yaml_parameters("general.yaml")
 
         # HEK/CHO ratio
-        self.ratio = 0.3
-        self.velocity = 0.5
-        # scale well size by diameter of cell:
-        self.cell_rad = 0.5
-        self.well_rad = 325
+        self.ratio = 0.7
         self.hek_color = np.array([255, 255, 0], dtype=int)
         self.cho_color = np.array([50, 50, 255], dtype=int)
+
+        # movement parameters
+        self.velocity = 0.2
+        self.noise_magnitude = self.velocity/20
+
+        # scale well size by diameter of cell:, size parameters
+        self.cell_rad = 0.5
+        self.well_rad = 325
+        self.initial_seed_rad = 325/8
+        self.cell_interaction_rad = 3.2
         self.dim = np.asarray(self.size)
         self.size = self.dim * self.well_rad
+
+        # cluster identification parameters
+        self.cluster_threshold = 3
+        self.cluster_interaction_threshold = 3.2
+        self.cluster_record_interval = 5
         self.cluster_timer = 0
 
     def setup(self):
@@ -159,7 +190,7 @@ class TestSimulation(Simulation):
         self.indicate_arrays("locations", "radii", "colors", "cell_type", "division_set", "div_thresh")
 
         # generate random locations for cells
-        self.locations = seed_cells(self.number_agents, self.well_rad/8, self.size)
+        self.locations = seed_cells(self.number_agents, self.initial_seed_rad, self.size)
         self.radii = self.agent_array(initial=lambda: self.cell_rad)
 
         # 1 is HEK293FT Cell (yellow), 0 is CHO K1 Cell (blue)
@@ -175,31 +206,38 @@ class TestSimulation(Simulation):
         self.neighbor_graph = self.agent_graph()
         self.cluster_graph = self.agent_graph()
 
+        # We're going to try to keep track of the clusters
+        self.clusters = []
+        self.cluster_centroids = np.zeros(1)
+        self.cluster_radii = []
+        self.cluster_sizes = np.zeros(1, dtype=int)
         # record initial values
         self.step_values()
-        self.get_clusters(1)
+        self.get_clusters(self.cluster_threshold, self.cluster_record_interval, self.cluster_interaction_threshold)
         self.step_image()
 
     def step(self):
         """ Overrides the step() method from the Simulation class.
         """
         # preform 60 subsets, each 1 second long
+        self.cluster_timer += 1
         for i in range(60):
             # increase division counter and determine if any cells are dividing
             self.reproduce(1)
 
             # get all neighbors within threshold (1.6 * diameter)
-            self.get_neighbors(self.neighbor_graph, 3.2 * self.cell_rad)
+            self.get_neighbors(self.neighbor_graph, self.cell_interaction_rad * self.cell_rad)
+            # self.clusters, self.cluster_centroids, self.cluster_radii, self.cluster_sizes = self.get_clusters(1)
 
+            self.get_clusters(self.cluster_threshold, self.cluster_record_interval,
+                              self.cluster_interaction_threshold)
             # move the cells
             self.move_parallel()
-            # self.noise()
+            self.noise(self.noise_magnitude)
             # add/remove agents from the simulation
             self.update_populations()
-        self.cluster_timer += 1
         # get the following data
         self.step_values()
-        self.get_clusters(1)
         print(f"HEK: {np.sum(self.cell_type)}")
         self.step_image()
         self.temp()
@@ -290,25 +328,24 @@ class TestSimulation(Simulation):
         center = self.size / 2
         neighbor_forces = np.zeros((self.number_agents, 3))
         grav_forces = np.zeros((self.number_agents, 3))
+        total_force = np.zeros((self.number_agents, 3))
 
         # get adhesive/repulsive forces from neighbors and gravity forces
         edge_forces = get_neighbor_forces(num_edges, edges, edge_forces, self.locations, center, self.cell_type,
                                           self.cell_rad)
         neighbor_forces = convert_edge_forces(num_edges, edges, edge_forces, neighbor_forces)
         grav_forces = get_gravity_forces(self.number_agents, self.locations, center, self.well_rad, grav_forces)
-
-        # get normalized vector of total force
-        total_force = neighbor_forces + grav_forces
+        # total_force = neighbor_forces + grav_forces
         for i in range(self.number_agents):
-            if np.linalg.norm(total_force[i]) > 0:
-                total_force[i] = total_force[i] / np.linalg.norm(total_force[i])
+            if np.linalg.norm(neighbor_forces[i]) > 1:
+                total_force[i] = (neighbor_forces[i]/np.linalg.norm(neighbor_forces[i])) + grav_forces[i]
+            elif np.linalg.norm(neighbor_forces[i]) > 0:
+                total_force[i] = neighbor_forces[i] + grav_forces[i]
             else:
-                # while gravity is active, this shouldn't be there, but otherwise it is.
-                total_force[i] = 0
-
+                total_force[i] = grav_forces[i]
+            total_force[i] = total_force[i] / np.linalg.norm(total_force[i])
         # update locations based on forces
-        self.locations += self.velocity * self.cell_rad * total_force
-
+        self.locations += 2 * self.velocity * self.cell_rad * total_force
         # check that the new location is within the space, otherwise use boundary values
         self.locations = np.where(self.locations > self.well_rad, self.well_rad, self.locations)
         self.locations = np.where(self.locations < 0, 0, self.locations)
@@ -325,6 +362,7 @@ class TestSimulation(Simulation):
             if self.division_set[index] > self.div_thresh[index]:
                 self.mark_to_hatch(index)
 
+    # Not used
     def remove_overlap(self, index):
         self.get_neighbors(self.neighbor_graph, 2*self.radii[index])
         while len(self.neighbor_graph.neighbors(index)) > 0:
@@ -349,41 +387,144 @@ class TestSimulation(Simulation):
         sim.full_setup()
         sim.run_simulation()
 
-    def noise(self, alpha=0.025):
+    def noise(self, alpha):
         self.locations += alpha * 2 * self.cell_rad * np.random.normal(size=(self.number_agents, 3)) * self.dim
 
-    def get_clusters(self, cell_type, cluster_threshold=5, time_thresh=20, cluster_distance=3.2):
+    def get_clusters(self, cluster_threshold, time_thresh, cluster_distance):
+        # Create graphs of specified distance.
         if self.cluster_timer % time_thresh == 0:
-            # Create graphs of specified distance.
-            self.get_neighbors(self.cluster_graph, cluster_distance * self.cell_rad)
-            edges = np.asarray(self.cluster_graph.get_edgelist())
-
-            num_edges = len(edges)
-            # Traverse graphs but filter out the non-desired cell_types
-            for i in range(num_edges):
-                cell_1 = edges[i][0]
-                cell_2 = edges[i][1]
-                if self.cell_type[cell_1] != cell_type or self.cell_type[cell_2] != cell_type:
-                    self.cluster_graph.delete_edges([(cell_1, cell_2)])
-
+            self.get_neighbors_clusters(self.cluster_graph, cluster_distance * self.cell_rad)
+            # Identify unique clusters in graph
             clusters = self.cluster_graph.clusters()
             file_name = f"{self.name}_values_{self.current_step}_clusters.csv"
             cluster_file = open(self.values_path + file_name, "w")
             if len(clusters) > 0:
                 centroids = np.zeros([len(clusters),3])
                 radius = np.zeros(len(clusters))
-
+                # Calculate Mean
                 for i in range(len(clusters)):
                     if len(clusters[i]) > cluster_threshold:
                         location_graph = self.locations[clusters[i]]
                         centroids[i] = np.mean(location_graph,0)
                         max_distance = 0
+                        # and Radius for circles
                         for j in range(len(clusters[i])):
                             if np.linalg.norm(location_graph[j]-centroids[i]) > max_distance:
                                 max_distance = np.linalg.norm(location_graph[j]-centroids[i])
                         radius[i] = max_distance
                         cluster_file.write(f"{centroids[i][0]}, {centroids[i][1]}, {centroids[i][2]}, {radius[i]}\n")
+                if len(centroids > 0):
+                    self.step_image_cluster(centroids, radius)
             cluster_file.close()
+
+
+    @record_time
+    def step_image_cluster(self, centroids, radius, background=(0, 0, 0), origin_bottom=True):
+        """ Creates an image of the simulation space with a cluster overlay.
+        """
+        # only continue if outputting images
+        if self.output_images:
+            # get path and make sure directory exists
+
+
+            # get the size of the array used for imaging in addition to the scaling factor
+            x_size = self.image_quality
+            scale = x_size / self.size[0]
+            y_size = math.ceil(scale * self.size[1])
+
+            # create the agent space background image and apply background color
+            image = np.zeros((y_size, x_size, 3), dtype=np.uint8)
+            background = (background[2], background[1], background[0])
+            image[:, :] = background
+
+            # go through all of the agents
+            for index in range(self.number_agents):
+                # get xy coordinates, the axis lengths, and color of agent
+                x, y = int(scale * self.locations[index][0]), int(scale * self.locations[index][1])
+                major, minor = int(scale * self.radii[index]), int(scale * self.radii[index])
+                color = (int(self.colors[index][2]), int(self.colors[index][1]), int(self.colors[index][0]))
+
+                # draw the agent and a black outline to distinguish overlapping agents
+                image = cv2.ellipse(image, (x, y), (major, minor), 0, 0, 360, color, -1)
+                image = cv2.ellipse(image, (x, y), (major, minor), 0, 0, 360, (0, 0, 0), 1)
+            for i in range(len(centroids)):
+                x = int(scale * centroids[i, 0])
+                y = int(scale * centroids[i, 1])
+                rad = int(radius[i] * scale)
+                image = cv2.ellipse(image, (x, y), (rad, rad), 0, 0, 360, (0, 0, 255), 3)
+            # if the origin should be bottom-left flip it, otherwise it will be top-left
+            if origin_bottom:
+                image = cv2.flip(image, 0)
+
+            # save the image as a PNG
+            image_compression = 4  # image compression of png (0: no compression, ..., 9: max compression)
+            file_name = f"{self.name}_image_{self.current_step}_cluster.png"
+            cv2.imwrite(self.images_path + file_name, image, [cv2.IMWRITE_PNG_COMPRESSION, image_compression])
+
+    @record_time
+    def get_neighbors_clusters(self, graph, distance, clear=True):
+        """ Finds all neighbors, within fixed radius, for each each agent.
+        """
+        # get graph object reference and if desired, remove all existing edges in the graph
+        if clear:
+            graph.delete_edges(None)
+
+        # don't proceed if no agents present
+        if np.sum(self.cell_type) == 0:
+            return
+
+        # assign each of the agents to bins, updating the max agents in a bin (if necessary)
+        bins, bins_help, bin_locations, graph.max_agents = self.assign_bins(graph.max_agents, distance)
+
+        # run until all edges are accounted for
+        while True:
+            # get the total amount of edges able to be stored and make the following arrays
+            # We are only looking at HEK cells here
+            length = np.sum(self.cell_type) * graph.max_neighbors
+            edges = np.zeros((length, 2), dtype=int)         # hold all edges
+            if_edge = np.zeros(length, dtype=bool)                 # say if each edge exists
+            edge_count = np.zeros(np.sum(self.cell_type), dtype=int)   # hold count of edges per agent
+
+            # if using CUDA GPU
+            if self.cuda:
+                # allow the following arrays to be passed to the GPU
+                edges = cuda.to_device(edges)
+                if_edge = cuda.to_device(if_edge)
+                edge_count = cuda.to_device(edge_count)
+
+                # specify threads-per-block and blocks-per-grid values
+                tpb = 72
+                bpg = math.ceil(self.number_agents / tpb)
+
+                # call the CUDA kernel, sending arrays to GPU
+                get_neighbors_gpu[bpg, tpb](cuda.to_device(self.locations), cuda.to_device(bin_locations),
+                                            cuda.to_device(bins), cuda.to_device(bins_help), distance, edges, if_edge,
+                                            edge_count, graph.max_neighbors)
+
+                # return the following arrays back from the GPU
+                edges = edges.copy_to_host()
+                if_edge = if_edge.copy_to_host()
+                edge_count = edge_count.copy_to_host()
+
+            # otherwise use parallelized JIT function
+            else:
+                edges, if_edge, edge_count = get_neighbors_cpu(np.sum(self.cell_type),  self.locations[self.cell_type==1], bin_locations, bins,
+                                                               bins_help, distance, edges, if_edge, edge_count,
+                                                               graph.max_neighbors)
+
+            # break the loop if all neighbors were accounted for or revalue the maximum number of neighbors
+            max_neighbors = np.amax(edge_count)
+            if graph.max_neighbors >= max_neighbors:
+                break
+            else:
+                graph.max_neighbors = max_neighbors * 2
+
+        # reduce the edges to edges that actually exist and add those edges to graph
+        graph.add_edges(edges[if_edge])
+
+        # simplify the graph's edges if not clearing the graph at the start
+        if not clear:
+            graph.simplify()
 
 
 if __name__ == "__main__":
